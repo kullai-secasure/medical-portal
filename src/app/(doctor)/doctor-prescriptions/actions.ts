@@ -7,6 +7,7 @@ import { authOptions } from "@/lib/auth-options";
 import { prisma } from "@/lib/prisma";
 import { createNotification } from "@/lib/notifications";
 import { logAccess } from "@/lib/audit";
+import { doctorTreatsPatient } from "@/lib/authorization";
 
 async function getCurrentDoctorOrThrow() {
   const session = await getServerSession(authOptions);
@@ -44,6 +45,14 @@ export async function createPrescription(
 
   if (!parsed.success) {
     return { success: false, error: parsed.error.issues[0]?.message ?? "Invalid prescription details." };
+  }
+
+  const hasRelationship = await doctorTreatsPatient(doctor.id, parsed.data.patientId);
+  if (!hasRelationship) {
+    return {
+      success: false,
+      error: "You are not authorized to prescribe for this patient.",
+    };
   }
 
   const prescription = await prisma.prescription.create({
