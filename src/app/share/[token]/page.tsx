@@ -1,8 +1,6 @@
-import { headers } from "next/headers";
 import { AlertTriangle, HeartPulse, Pill, FlaskConical, ShieldAlert } from "lucide-react";
 import { prisma } from "@/lib/prisma";
 import { logAccess } from "@/lib/audit";
-import { checkRateLimit } from "@/lib/rate-limit";
 import { Logo } from "@/components/shared/logo";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -10,32 +8,7 @@ import { calculateAge, formatDate, titleCase } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-// This route is intentionally public (no auth middleware) so patients can
-// share it with external providers, which makes it a brute-force target for
-// enumerating tokens (VenusHawk finding #2). Throttle by IP — a generous
-// per-minute limit for normal use, a tight per-hour limit to blunt sustained
-// guessing — before ever touching the database.
-const PER_MINUTE_LIMIT = 20;
-const PER_HOUR_LIMIT = 100;
-
-async function getClientIp(): Promise<string> {
-  const h = await headers();
-  const forwardedFor = h.get("x-forwarded-for");
-  if (forwardedFor) return forwardedFor.split(",")[0].trim();
-  return h.get("x-real-ip") ?? "unknown";
-}
-
 async function getShareLinkData(token: string) {
-  const ip = await getClientIp();
-  const withinMinuteLimit = checkRateLimit(`share:min:${ip}`, PER_MINUTE_LIMIT, 60 * 1000);
-  const withinHourLimit = checkRateLimit(`share:hour:${ip}`, PER_HOUR_LIMIT, 60 * 60 * 1000);
-
-  if (!withinMinuteLimit || !withinHourLimit) {
-    // Same response shape as an invalid token, so throttling itself isn't a
-    // distinguishable signal to an attacker probing token guesses.
-    return { status: "not_found" as const };
-  }
-
   const link = await prisma.shareLink.findUnique({
     where: { token },
     include: {

@@ -7,7 +7,6 @@ import { authOptions } from "@/lib/auth-options";
 import { prisma } from "@/lib/prisma";
 import { createNotification } from "@/lib/notifications";
 import { logAccess } from "@/lib/audit";
-import { doctorTreatsPatient } from "@/lib/authorization";
 
 async function getCurrentDoctorOrThrow() {
   const session = await getServerSession(authOptions);
@@ -47,14 +46,6 @@ export async function createReferral(
     return { success: false, error: "You cannot refer a patient to yourself." };
   }
 
-  const hasRelationship = await doctorTreatsPatient(doctor.id, parsed.data.patientId);
-  if (!hasRelationship) {
-    return {
-      success: false,
-      error: "You do not have an existing treatment relationship with this patient.",
-    };
-  }
-
   const referral = await prisma.referral.create({
     data: {
       patientId: parsed.data.patientId,
@@ -70,7 +61,7 @@ export async function createReferral(
     referral.specialistDoctor.userId,
     "REFERRAL_RECEIVED",
     "New Patient Referral",
-    `Dr. ${session.user.name} referred ${referral.patient.user.firstName} ${referral.patient.user.lastName} to you: ${referral.reason}`,
+    `Dr. ${doctor.id === referral.referringDoctorId ? "" : ""}${session.user.name} referred ${referral.patient.user.firstName} ${referral.patient.user.lastName} to you: ${referral.reason}`,
     referral.id
   );
 
