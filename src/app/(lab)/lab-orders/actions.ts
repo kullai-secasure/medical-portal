@@ -28,41 +28,8 @@ const uploadResultSchema = z.object({
   isAbnormal: z.string().optional(),
 });
 
-// The on-disk extension is derived ONLY from this table, never from the
-// client-supplied filename — decoupling the two let an attacker upload a
-// part labeled Content-Type: image/png but named payload.svg, which was
-// then written to public/uploads with a .svg extension and served (and
-// rendered/executed) as SVG/HTML by the browser (VenusHawk finding #7).
-const EXT_BY_TYPE: Record<string, string> = {
-  "application/pdf": "pdf",
-  "image/png": "png",
-  "image/jpeg": "jpg",
-};
-
+const ALLOWED_TYPES = new Set(["application/pdf", "image/png", "image/jpeg", "image/jpg"]);
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB
-
-// Server-side magic-byte check. The browser-supplied `file.type` is just a
-// client claim and can be spoofed independently of the actual bytes, so we
-// verify the file's real signature matches the claimed/allowed type before
-// trusting it.
-function sniffAllowedType(buffer: Buffer): string | null {
-  if (buffer.length >= 4 && buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) {
-    return "application/pdf"; // %PDF
-  }
-  if (
-    buffer.length >= 8 &&
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47
-  ) {
-    return "image/png"; // \x89PNG
-  }
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return "image/jpeg"; // \xFF\xD8\xFF
-  }
-  return null;
-}
 
 export async function uploadLabResult(
   _prevState: ActionState,
@@ -94,28 +61,23 @@ export async function uploadLabResult(
   let fileType: string | undefined;
 
   if (file && file.size > 0) {
+    if (!ALLOWED_TYPES.has(file.type)) {
+      return { success: false, error: "Only PDF, PNG, or JPEG files are allowed." };
+    }
     if (file.size > MAX_FILE_BYTES) {
       return { success: false, error: "File must be under 10MB." };
     }
 
     const bytes = await file.arrayBuffer();
     const buffer = Buffer.from(bytes);
-
-    const detectedType = sniffAllowedType(buffer);
-    if (!detectedType || !EXT_BY_TYPE[detectedType]) {
-      return { success: false, error: "Only PDF, PNG, or JPEG files are allowed." };
-    }
-
-    const ext = EXT_BY_TYPE[detectedType];
+    const ext = file.name.split(".").pop() || "bin";
     const safeName = `${labResult.id}-${Date.now()}.${ext}`;
     const uploadDir = path.join(process.cwd(), "public", "uploads", "lab-results");
     await writeFile(path.join(uploadDir, safeName), buffer);
 
     fileUrl = `/uploads/lab-results/${safeName}`;
-    // The original filename is kept only as a display label — it is never
-    // used to choose the on-disk extension or content type.
     fileName = file.name;
-    fileType = detectedType;
+    fileType = file.type;
   }
 
   await prisma.labResult.update({

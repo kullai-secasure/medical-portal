@@ -1,6 +1,5 @@
 "use server";
 
-import { randomBytes } from "crypto";
 import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import { getCurrentPatient } from "@/lib/data";
@@ -11,14 +10,8 @@ export async function createShareLink(expiryHours: number) {
 
   const expiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000);
 
-  // A 256-bit random token, not the schema's cuid default — cuids are
-  // shorter and semi-predictable (timestamp + counter based), which makes
-  // them a realistic brute-force target for an unauthenticated, unthrottled
-  // lookup endpoint (VenusHawk finding #2).
-  const token = randomBytes(32).toString("base64url");
-
   const link = await prisma.shareLink.create({
-    data: { patientId: patient.id, expiresAt, token },
+    data: { patientId: patient.id, expiresAt },
   });
 
   await logAccess(patient.userId, "CREATE", "ShareLink", `Created share link expiring in ${expiryHours}h`, {

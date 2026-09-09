@@ -2,7 +2,6 @@
 
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentPatient } from "@/lib/data";
 import { createNotification } from "@/lib/notifications";
@@ -23,27 +22,12 @@ export type BookAppointmentState = {
   error?: string;
 };
 
-const ACTIVE_STATUSES = ["SCHEDULED", "CONFIRMED"] as const;
-
 function nextRecurrenceDate(date: Date, rule: string): Date {
   const next = new Date(date);
   if (rule === "WEEKLY") next.setDate(next.getDate() + 7);
   else if (rule === "BIWEEKLY") next.setDate(next.getDate() + 14);
   else if (rule === "MONTHLY") next.setMonth(next.getMonth() + 1);
   return next;
-}
-
-function computeOccurrence(base: Date, rule: string, index: number): Date {
-  let d = new Date(base);
-  for (let i = 0; i < index; i++) d = nextRecurrenceDate(d, rule);
-  return d;
-}
-
-// Postgres serialization failure — thrown when a concurrent transaction
-// committed a conflicting row first. Used to detect double-booking races
-// that slip past the in-transaction findFirst check (VenusHawk finding #4).
-function isSerializationFailure(err: unknown): boolean {
-  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2034";
 }
 
 export async function bookAppointment(
@@ -78,72 +62,47 @@ export async function bookAppointment(
     return { success: false, error: "Please choose a future date and time." };
   }
 
+  // Check doctor-blocked slots
+  const blocked = await prisma.blockedSlot.findFirst({
+    where: { doctorId, startTime: { lte: scheduledAt }, endTime: { gt: scheduledAt } },
+  });
+  if (blocked) {
+    return { success: false, error: "This doctor is unavailable at that time." };
+  }
+
   const patient = await getCurrentPatient();
   const occurrences = recurrenceRule === "NONE" ? 1 : recurrenceCount;
   const recurrenceEndDate =
     recurrenceRule === "NONE" ? null : computeOccurrence(scheduledAt, recurrenceRule, occurrences - 1);
 
-  try {
-    await prisma.$transaction(
-      async (tx) => {
-        let parentId: string | undefined;
-        for (let i = 0; i < occurrences; i++) {
-          const occurrenceAt = computeOccurrence(scheduledAt, recurrenceRule, i);
-
-          const blocked = await tx.blockedSlot.findFirst({
-            where: { doctorId, startTime: { lte: occurrenceAt }, endTime: { gt: occurrenceAt } },
-          });
-          if (blocked) {
-            throw new Error("This doctor is unavailable at that time.");
-          }
-
-          // Conflict check inside the (serializable) transaction — without
-          // this, two concurrent bookings for the same doctor/time both
-          // succeed since only BlockedSlot was ever checked (finding #4).
-          const conflict = await tx.appointment.findFirst({
-            where: { doctorId, scheduledAt: occurrenceAt, status: { in: [...ACTIVE_STATUSES] } },
-          });
-          if (conflict) {
-            throw new Error("This slot was just booked. Please choose another time.");
-          }
-
-          const created = await tx.appointment.create({
-            data: {
-              patientId: patient.id,
-              doctorId,
-              scheduledAt: occurrenceAt,
-              type,
-              reason,
-              status: "SCHEDULED",
-              recurrenceRule: recurrenceRule === "NONE" ? null : recurrenceRule,
-              recurrenceEndDate,
-              parentAppointmentId: i === 0 ? undefined : parentId,
-            },
-          });
-          if (i === 0) parentId = created.id;
-        }
+  let parentId: string | undefined;
+  for (let i = 0; i < occurrences; i++) {
+    const created = await prisma.appointment.create({
+      data: {
+        patientId: patient.id,
+        doctorId,
+        scheduledAt: computeOccurrence(scheduledAt, recurrenceRule, i),
+        type,
+        reason,
+        status: "SCHEDULED",
+        recurrenceRule: recurrenceRule === "NONE" ? null : recurrenceRule,
+        recurrenceEndDate,
+        parentAppointmentId: i === 0 ? undefined : parentId,
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-    );
-  } catch (err) {
-    if (isSerializationFailure(err)) {
-      return { success: false, error: "This slot was just booked. Please choose another time." };
-    }
-    return { success: false, error: err instanceof Error ? err.message : "Could not book appointment." };
+    });
+    if (i === 0) parentId = created.id;
   }
-
-  await logAccess(
-    patient.userId,
-    "CREATE",
-    "Appointment",
-    `Booked ${occurrences > 1 ? `${occurrences} recurring appointments` : "an appointment"} with doctor`,
-    { patientId: patient.id, resourceId: doctorId }
-  );
 
   revalidatePath("/appointments");
   revalidatePath("/dashboard");
 
   return { success: true };
+}
+
+function computeOccurrence(base: Date, rule: string, index: number): Date {
+  let d = new Date(base);
+  for (let i = 0; i < index; i++) d = nextRecurrenceDate(d, rule);
+  return d;
 }
 
 export async function cancelAppointment(appointmentId: string) {
@@ -153,11 +112,6 @@ export async function cancelAppointment(appointmentId: string) {
     where: { id: appointmentId, patientId: patient.id },
     data: { status: "CANCELLED" },
     include: { doctor: { include: { user: true } } },
-  });
-
-  await logAccess(patient.userId, "UPDATE", "Appointment", "Cancelled appointment", {
-    patientId: patient.id,
-    resourceId: appointment.id,
   });
 
   revalidatePath("/appointments");
@@ -241,64 +195,32 @@ export async function rescheduleAppointment(
     return { success: false, error: "Appointment not found." };
   }
 
-  let created: { id: string } | undefined;
-  try {
-    await prisma.$transaction(
-      async (tx) => {
-        const blocked = await tx.blockedSlot.findFirst({
-          where: {
-            doctorId: original.doctorId,
-            startTime: { lte: newScheduledAt },
-            endTime: { gt: newScheduledAt },
-          },
-        });
-        if (blocked) {
-          throw new Error("This doctor is unavailable at that time.");
-        }
-
-        const conflict = await tx.appointment.findFirst({
-          where: {
-            doctorId: original.doctorId,
-            scheduledAt: newScheduledAt,
-            status: { in: [...ACTIVE_STATUSES] },
-          },
-        });
-        if (conflict) {
-          throw new Error("This slot was just booked. Please choose another time.");
-        }
-
-        await tx.appointment.update({
-          where: { id: original.id },
-          data: { status: "CANCELLED" },
-        });
-
-        created = await tx.appointment.create({
-          data: {
-            patientId: original.patientId,
-            doctorId: original.doctorId,
-            scheduledAt: newScheduledAt,
-            durationMin: original.durationMin,
-            type: original.type,
-            reason: original.reason,
-            status: "SCHEDULED",
-            rescheduledFromId: original.id,
-            rescheduleCount: original.rescheduleCount + 1,
-          },
-        });
-      },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-    );
-  } catch (err) {
-    if (isSerializationFailure(err)) {
-      return { success: false, error: "This slot was just booked. Please choose another time." };
-    }
-    return { success: false, error: err instanceof Error ? err.message : "Could not reschedule appointment." };
+  const blocked = await prisma.blockedSlot.findFirst({
+    where: { doctorId: original.doctorId, startTime: { lte: newScheduledAt }, endTime: { gt: newScheduledAt } },
+  });
+  if (blocked) {
+    return { success: false, error: "This doctor is unavailable at that time." };
   }
 
-  await logAccess(patient.userId, "UPDATE", "Appointment", "Rescheduled appointment", {
-    patientId: patient.id,
-    resourceId: created?.id ?? original.id,
-  });
+  await prisma.$transaction([
+    prisma.appointment.update({
+      where: { id: original.id },
+      data: { status: "CANCELLED" },
+    }),
+    prisma.appointment.create({
+      data: {
+        patientId: original.patientId,
+        doctorId: original.doctorId,
+        scheduledAt: newScheduledAt,
+        durationMin: original.durationMin,
+        type: original.type,
+        reason: original.reason,
+        status: "SCHEDULED",
+        rescheduledFromId: original.id,
+        rescheduleCount: original.rescheduleCount + 1,
+      },
+    }),
+  ]);
 
   revalidatePath("/appointments");
   revalidatePath("/dashboard");

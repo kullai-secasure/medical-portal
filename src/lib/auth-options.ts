@@ -1,14 +1,6 @@
 import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { getUserByEmail, verifyPassword } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
-
-// A pre-computed bcrypt hash with no corresponding real password. Comparing
-// against this when the account doesn't exist keeps authorize()'s timing
-// indistinguishable from the "wrong password" path, closing the user
-// enumeration / credential-state oracle (VenusHawk finding #8).
-const DUMMY_PASSWORD_HASH = "$2b$10$rDjsFv0Um9J9rWWShCQF6.GXRDloFqMiYyXsDx9h8MQ2Ph2xFmgKG";
-const GENERIC_AUTH_ERROR = "Invalid email or password";
 
 export const authOptions: NextAuthOptions = {
   providers: [
@@ -20,23 +12,24 @@ export const authOptions: NextAuthOptions = {
       },
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) {
-          throw new Error(GENERIC_AUTH_ERROR);
+          throw new Error("Invalid credentials");
         }
 
         const user = await getUserByEmail(credentials.email);
+        if (!user) {
+          throw new Error("No user found with this email");
+        }
 
-        // Always run a bcrypt compare, even for a nonexistent user, so the
-        // response time and error message are identical for "no such
-        // account", "wrong password", and "disabled account". Only the
-        // generic message below is ever thrown back to the client; the
-        // specific reason is not exposed.
         const isPasswordValid = await verifyPassword(
           credentials.password,
-          user?.passwordHash ?? DUMMY_PASSWORD_HASH
+          user.passwordHash
         );
+        if (!isPasswordValid) {
+          throw new Error("Invalid password");
+        }
 
-        if (!user || !isPasswordValid || !user.isActive) {
-          throw new Error(GENERIC_AUTH_ERROR);
+        if (!user.isActive) {
+          throw new Error("User account is disabled");
         }
 
         return {
@@ -55,35 +48,12 @@ export const authOptions: NextAuthOptions = {
         token.id = user.id;
         token.role = user.role;
       }
-
-      if (!token.id) {
-        return {};
-      }
-
-      // Re-validate against the database on every request instead of trusting
-      // the claims baked in at sign-in. Without this, disabling a user or
-      // changing their role does not take effect until the JWT's 30-day
-      // maxAge expires (VenusHawk finding #3).
-      const dbUser = await prisma.user.findUnique({
-        where: { id: token.id as string },
-        select: { isActive: true, role: true },
-      });
-
-      if (!dbUser || !dbUser.isActive) {
-        return {};
-      }
-
-      token.role = dbUser.role;
       return token;
     },
     async session({ session, token }) {
-      if (session.user && token.id) {
+      if (session.user) {
         session.user.id = token.id as string;
         session.user.role = token.role as string;
-      } else {
-        // Token was invalidated by the jwt callback (disabled/deleted user) —
-        // return a session with no user so callers treat this as signed out.
-        session.user = undefined as unknown as typeof session.user;
       }
       return session;
     },
